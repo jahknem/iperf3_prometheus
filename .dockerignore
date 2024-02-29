@@ -1,0 +1,15 @@
+venv/
+*.pyc
+*.pyo
+*.pyd
+__pycache__
+.pytest_cache/
+*.pyc
+.DS_Store
+.git
+.gitignore
+.dockerignore
+README.md
+LICENSE
+Dockerfile
+*.md
