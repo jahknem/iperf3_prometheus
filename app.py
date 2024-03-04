@@ -1,75 +1,83 @@
-from flask import Flask
+from flask import Flask, request, jsonify
 from prometheus_client import generate_latest, REGISTRY, Gauge
-import subprocess
-import re
+import iperf3
+import threading
+import json
 import os
+import datetime
 
 app = Flask(__name__)
 
-# Prometheus Gauges with labels for client IPs
-iperf3_jitter = Gauge('iperf3_jitter_ms', 'Jitter in milliseconds', ['client_ip', 'port'])
-iperf3_packet_loss = Gauge('iperf3_packet_loss', 'Lost datagrams', ['client_ip', 'port'])
-iperf3_total_datagrams = Gauge('iperf3_total_datagrams', 'Total datagrams', ['client_ip', 'port'])
+# Define Prometheus Gauges
+iperf3_bandwidth = Gauge('iperf3_bandwidth', 'Bandwidth measured by iperf3', ['port', 'sender_ip'])
+iperf3_jitter = Gauge('iperf3_jitter', 'Jitter measured by iperf3', ['port', 'sender_ip'])
+iperf3_packet_loss = Gauge('iperf3_packet_loss', 'Packet loss measured by iperf3', ['port', 'sender_ip',])
 
-def parse_iperf3_log(file_path, port):
-    with open(file_path, 'r') as file:
-        lines = file.readlines()
-    sessions_data = parse_iperf3_logs(lines)
+# Global structure to store test results
+iperf3_results = {}
 
-
-    # Update Prometheus metrics
-    for client_ip, session_data in sessions_data.items():
-        # Since session_data['jitter_ms'], session_data['lost_datagrams'], and session_data['total_datagrams']
-        # are lists, we need to decide how to aggregate or select the values (e.g., last value, max, average)
-        # Here, we're using the last value of each list for simplicity.
-
-        jitter = session_data['jitter_ms'][-1] if session_data['jitter_ms'] else 0
-        lost = session_data['lost_datagrams'][-1] if session_data['lost_datagrams'] else 0
-        total = session_data['total_datagrams'][-1] if session_data['total_datagrams'] else 0
-
-        iperf3_jitter.labels(client_ip=client_ip, port=port).set(jitter)
-        iperf3_packet_loss.labels(client_ip=client_ip, port=port).set(lost)
-        iperf3_total_datagrams.labels(client_ip=client_ip, port=port).set(total)
-
-def parse_iperf3_logs(lines):
-    sessions_data = {}
-    current_session_key = None
-
-    for line in lines:
-        # New session detection
-        if "Accepted connection from" in line:
-            ip_match = re.search(r"Accepted connection from ([\d\.]+),", line)
-            if ip_match:
-                client_ip = ip_match.group(1)
-                current_session_key = client_ip  # Use IP as key; assuming unique sessions per IP for simplicity
-                sessions_data[current_session_key] = {
-                    "jitter_ms": [],
-                    "lost_datagrams": [],
-                    "total_datagrams": []
-                }
-        
-        # Metrics collection
-        if current_session_key:
-            jitter_match = re.search(r"Jitter\s+([\d\.]+)\s+ms", line)
-            lost_total_match = re.search(r"(\d+)/(\d+)\s+\(0%\)", line)  # Simplified to match given example
-            if jitter_match:
-                sessions_data[current_session_key]["jitter_ms"].append(float(jitter_match.group(1)))
-            if lost_total_match:
-                lost, total = lost_total_match.groups()
-                sessions_data[current_session_key]["lost_datagrams"].append(int(lost))
-                sessions_data[current_session_key]["total_datagrams"].append(int(total))
-
-    return sessions_data
-
+def iperf3_server_thread(port):
+    try:
+        server = iperf3.Server()
+        server.port = port
+        server.json_output = True
+        print(f"Starting iperf3 server on port {port}")
+        while True:
+            try:
+                result = server.run()
+            except Exception as e:
+                print(f"Failed to run iperf3 server on port {port}: {e}")
+                continue
+            print(f"Test result for port {port}: {result}")
+            # Save dict as iperf3_port_date_time.json
+            if not result.error:
+                try:
+                    result_data = result.json
+                    sender_ip = result_data['start']['connected'][0]['remote_host']
+                    bandwidth = result_data.get('end', {}).get('sum_received', {}).get('bits_per_second', 0)
+                    jitter = result_data.get('end', {}).get('sum_received', {}).get('jitter_ms', 0)
+                    packet_loss = result_data.get('end', {}).get('sum_received', {}).get('lost_percent', 0)
+                    
+                    # Use a combination of port, sender IP, and test ID as the unique key
+                    result_key = (port, sender_ip)
+                    iperf3_results[result_key] = {
+                        'bandwidth': bandwidth,
+                        'jitter': jitter,
+                        'packet_loss': packet_loss,
+                    }
+                except Exception as e:
+                    print(f"Failed to handle test result for port {port}: {e}")
+    except Exception as e:
+        print(f"Failed to start iperf3 server thread on port {port}: {e}")
 
 @app.route('/metrics')
 def metrics():
-    ports = [5201, 5202, 5203, 5204, 5205]
-    for port in ports:
-        log_file_path = f'/tmp/iperf3_{port}.log'
-        if os.path.exists(log_file_path):
-            parse_iperf3_log(log_file_path, str(port))
-    return generate_latest(REGISTRY)
+    global iperf3_results
+    # Format the stored results for Prometheus
+    for result_key, metrics in iperf3_results.items():
+        port, sender_ip = result_key
+        iperf3_bandwidth.labels(port=str(port), sender_ip=sender_ip).set(metrics['bandwidth'])
+        iperf3_jitter.labels(port=str(port), sender_ip=sender_ip).set(metrics['jitter'])
+        iperf3_packet_loss.labels(port=str(port), sender_ip=sender_ip).set(metrics['packet_loss'])
+
+    # Clear the results after serving them
+    iperf3_results.clear()
+    return generate_latest(REGISTRY), 200
+
+
+@app.route('/endpoint', methods=['POST'])
+def endpoint():
+    data = request.json
+    # Process the data as needed
+    return jsonify({"message": "Data received and processed"}), 200
 
 if __name__ == '__main__':
+    ports = [5201]  # Example ports
+    for port in ports:
+        try:
+            print(f"Initializing iperf3 server on port {port}")
+            threading.Thread(target=iperf3_server_thread, args=(port,)).start()
+        except Exception as e:
+            print(f"Failed to initialize iperf3 server on port {port}: {e}")
+
     app.run(host='0.0.0.0', port=5000)

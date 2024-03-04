@@ -7,4 +7,9 @@ __pycache__
 *.pyc
 .DS_Store
 .git
+.gitignore
+.dockerignore
+README.md
+LICENSE
+Dockerfile
 *.md
